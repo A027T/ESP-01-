@@ -1,0 +1,35 @@
+name: ESP Telegram Bridge
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/30 * * * *"      # safety net; the bridge also re-queues itself before exiting
+
+# Only one bridge at a time; a newer run waits for the current one to finish.
+concurrency:
+  group: esp-bridge
+  cancel-in-progress: false
+
+permissions:
+  actions: write                 # lets the bridge queue its own next run
+  contents: read
+
+jobs:
+  bridge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 358
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: pip install requests
+      - name: Run bridge
+        run: python bridge.py
+        env:
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          DATA_PAT: ${{ secrets.DATA_PAT }}
+          DATA_REPO: ${{ secrets.DATA_REPO }}
+          OUTBOX_ISSUE: "1"
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_SECONDS: "21000"       # 5h50m, then hand over to the next run
+          GH_POLL_SECONDS: "2"
