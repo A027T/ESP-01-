@@ -416,6 +416,12 @@ STR = {
         "widgets": "🧩 دکمه‌های من", "widgets_title": "🧩 دکمه‌ها و متغیرها (برای حذف 🗑 را بزن)",
         "no_widgets": "هنوز دکمه‌ای نساخته‌ای. بگو: «یه دکمه بساز که لامپ x رو روشن/خاموش کنه» یا «برای سرعت فن دکمه + و - بساز، از ۰ تا ۲۵۵ با گام ۱۰»",
         "wifi": "وای‌فای", "internet": "اینترنت (GitHub)", "uptime": "مدت روشن بودن",
+        "add_token": "➕ افزودن توکن هوش مصنوعی", "test_keys": "🔄 تست کلیدها", "cancel": "✖️ انصراف",
+        "key_prompt": "🔑 کلید API را همین‌جا بفرست (فقط خود کلید).\nسرویس را خودم تشخیص می‌دهم، پیامت را پاک می‌کنم و کلید را تست می‌کنم.",
+        "key_cancel": "لغو شد", "which_provider": "این کلید مال کدام سرویس است؟",
+        "key_ok": "✅ کلید {id} ({provider} / {model}) کار می‌کند. پیام حاوی کلید پاک شد.",
+        "key_fail": "⚠️ کلید {id} ذخیره شد ولی تست شکست خورد: {err}\nکلید، اینترنت یا نام مدل را چک کن. دستی: /addkey سرویس کلید مدل",
+        "key_expired": "منقضی شد. دوباره کلید را بفرست", "no_keys": "هنوز کلیدی نیست. دکمهٔ ➕ را بزن و کلید را بفرست",
     },
     "en": {
         "title": "📱 Control panel", "devices": "💡 Devices", "sensors": "📊 Sensors", "scenes": "🎬 Scenes",
@@ -446,6 +452,12 @@ STR = {
         "widgets": "🧩 My buttons", "widgets_title": "🧩 Buttons and variables (tap 🗑 to delete)",
         "no_widgets": "No custom buttons yet. Say: \"make a button that toggles lamp x\" or \"make + and - buttons for the fan speed, 0 to 255, step 10\"",
         "wifi": "Wi-Fi", "internet": "Internet (GitHub)", "uptime": "Uptime",
+        "add_token": "➕ Add AI token", "test_keys": "🔄 Test keys", "cancel": "✖️ Cancel",
+        "key_prompt": "🔑 Send the API key here (just the key).\nI detect the service, delete your message and test the key.",
+        "key_cancel": "Cancelled", "which_provider": "Which service is this key for?",
+        "key_ok": "✅ Key {id} ({provider} / {model}) works. The message containing the key was deleted.",
+        "key_fail": "⚠️ Key {id} saved but the test failed: {err}\nCheck the key, the internet or the model name. Manual: /addkey provider KEY MODEL",
+        "key_expired": "Expired. Send the key again", "no_keys": "No keys yet. Tap ➕ and send the key",
     },
 }
 SCREEN_KEYS = [("widgets", "wid"), ("kb_panel", "home"), ("devices", "dev"), ("sensors", "sen"), ("scenes", "scn"), ("auto", "aut"),
@@ -1701,16 +1713,137 @@ def llm_call(k, system, msgs):
         return 502, "unexpected response shape"
 
 
+KEY_PREFIXES = [("sk-ant-", "anthropic"), ("sk-or-", "openrouter"), ("gsk_", "groq"), ("AIza", "gemini"),
+                ("sk-proj-", "openai"), ("sk-svcacct-", "openai")]
+PROVIDER_ALIASES = {"claude": "anthropic", "gpt": "openai", "chatgpt": "openai", "google": "gemini", "llama": "groq"}
+PREFER = {
+    "anthropic": ["haiku", "sonnet"],
+    "openai": ["gpt-4o-mini", "gpt-4.1-mini", "mini", "gpt-4o", "gpt-"],
+    "gemini": ["flash", "pro"],
+    "groq": ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "versatile", "instant", "llama"],
+    "openrouter": ["openrouter/auto"],
+    "deepseek": ["deepseek-chat"],
+    "mistral": ["mistral-small-latest", "small", "mistral-large-latest", "mistral"],
+}
+_BAD = ("embed", "whisper", "tts", "audio", "guard", "moderation", "image", "dall", "transcribe", "vision", "rerank",
+        "speech", "realtime", "search", "davinci", "babbage", "computer-use", "live", "imagen", "veo", "gemma")
+_DATE = re.compile(r"\d{8}|\d{4}-\d{2}-\d{2}")
+PENDING_KEY = {"key": None, "ts": 0.0}
+
+
+def looks_like_key(text):
+    t = text.strip()
+    return 20 <= len(t) <= 250 and not any(c.isspace() for c in t) and any(t.startswith(p) for p, _ in KEY_PREFIXES)
+
+
+def detect_provider(key):
+    for prefix, prov in KEY_PREFIXES:
+        if key.startswith(prefix):
+            return prov
+    if re.fullmatch(r"sk-[0-9a-f]{32}", key):
+        return "deepseek"
+    for prov in ("openai", "mistral", "deepseek"):          # unknown format: whichever service accepts it
+        try:
+            r = requests.get(PRESETS[prov][1].rstrip("/") + "/models", headers={"Authorization": f"Bearer {key}"}, timeout=15)
+            if r.status_code == 200:
+                return prov
+        except requests.RequestException:
+            pass
+    return None
+
+
+def list_models(k):
+    """Returns (ids or None, http_status)."""
+    base = k["base_url"].rstrip("/")
+    try:
+        if k["type"] == "anthropic":
+            r = requests.get(base + "/v1/models", params={"limit": 100}, timeout=20,
+                             headers={"x-api-key": k["key"], "anthropic-version": "2023-06-01"})
+        else:
+            r = requests.get(base + "/models", headers={"Authorization": f"Bearer {k['key']}"}, timeout=20)
+        if r.status_code != 200:
+            return None, r.status_code
+        j = r.json()
+        items = j.get("data") or j.get("models") or []
+        return [str(m.get("id") or m.get("name") or "") for m in items if isinstance(m, dict)], 200
+    except (requests.RequestException, ValueError):
+        return None, 0
+
+
+def rank_models(provider, ids):
+    ids = [i.split("/", 1)[1] if i.startswith("models/") else i for i in ids if i]
+    good = [i for i in ids if not any(b in i.lower() for b in _BAD)] or list(ids)
+    ranked = []
+    for pref in PREFER.get(provider, []):
+        c = [i for i in good if pref in i.lower() and i not in ranked]
+        if provider == "gemini":
+            c = [i for i in c if not any(x in i for x in ("preview", "exp", "lite", "latest"))] or c
+        c.sort(reverse=True)                                 # newest-looking version first
+        c.sort(key=lambda i: bool(_DATE.search(i)))          # stable: undated aliases before dated snapshots
+        ranked += c
+    ranked += [i for i in good if i not in ranked]
+    return ranked[:5]
+
+
+def _test_key(k):
+    try:
+        return llm_call(k, "Reply with the single word OK.", [{"role": "user", "content": "ping"}])
+    except requests.RequestException as e:
+        return 0, e.__class__.__name__
+
+
+def fix_model(k):
+    """The saved model name no longer exists: ask the service which models it has and switch to a good one."""
+    ids, _ = list_models(k)
+    if not ids:
+        return False
+    for m in rank_models(k["provider"], ids):
+        if m != k["model"]:
+            with L:
+                k["model"] = m
+                KEYS.mark()
+            return True
+    return False
+
+
+def setup_key(provider, key, model=None, base_url=None):
+    """Add, test and (if the default model is gone) auto-pick a working model. Returns (key, ok, message)."""
+    k = add_key(provider, key, model, base_url)
+    st, out = _test_key(k)
+    if st != 200 and not model and st in (400, 404, 422):
+        ids, _ = list_models(k)
+        for m in (rank_models(k["provider"], ids) if ids else []):
+            if m == k["model"]:
+                continue
+            k["model"] = m
+            st, out = _test_key(k)
+            if st == 200:
+                break
+    if st == 200:
+        mark_ok(k)
+        KEYS.save(force=True)
+        return k, True, T("key_ok", id=k["id"], provider=k["provider"], model=k["model"])
+    mark_fail(k, st, out)
+    KEYS.save(force=True)
+    return k, False, T("key_fail", id=k["id"], err=f"{st} {str(out)[:100]}")
+
+
 def call_llm(system, msgs):
     """Try every available key in turn. Returns text or None."""
     for k in ordered_keys():
-        try:
-            st, out = llm_call(k, system, msgs)
-        except requests.RequestException as e:
-            st, out = 0, e.__class__.__name__
-        if st == 200 and out.strip():
-            mark_ok(k)
-            return out
+        st, out = 0, ""
+        for attempt in range(2):
+            try:
+                st, out = llm_call(k, system, msgs)
+            except requests.RequestException as e:
+                st, out = 0, e.__class__.__name__
+            if st == 200 and out.strip():
+                mark_ok(k)
+                return out
+            if attempt == 0 and st in (400, 404) and "model" in str(out).lower() and fix_model(k):
+                log(f"AI key {k['id']}: model replaced automatically")
+                continue
+            break
         mark_fail(k, st, out)
         log(f"AI key {k['id']} ({k['provider']}) failed: {st}")
     return None
@@ -2129,7 +2262,8 @@ def scr_home(args):
     live = live_line()
     if live:
         text += "\n" + live
-    rows = widget_rows() + [[(T("devices"), "m:dev"), (T("sensors"), "m:sen")], [(T("scenes"), "m:scn"), (T("auto"), "m:aut")],
+    onboarding = [] if KEYS.data["keys"] else [[(T("add_token"), "m:ak")]]
+    rows = onboarding + widget_rows() + [[(T("devices"), "m:dev"), (T("sensors"), "m:sen")], [(T("scenes"), "m:scn"), (T("auto"), "m:aut")],
                             [(T("board"), "m:brd"), (T("ai"), "m:ai")], [(T("settings"), "m:set")]]
     return text, rows
 
@@ -2275,8 +2409,14 @@ def scr_wid(args):
 
 
 def scr_ai(args):
-    rows = [[(T("mode_btn", mode=state.get("mode")), "m:st:mode"), (T("forget"), "m:st:forget")], [(T("home"), "m:home")]]
-    return T("ai_title") + "\n" + cmd_keys() + "\n\n/addkey provider KEY [model]", rows
+    with L:
+        ks = list(KEYS.data["keys"])
+    rows = [[(T("add_token"), "m:ak"), (T("test_keys"), "m:kt")]]
+    for k in ks[:8]:
+        rows.append([(f"🗑 {k['id']} {k['provider']}", f"m:kd:{k['id']}")])
+    rows.append([(T("mode_btn", mode=state.get("mode")), "m:st:mode"), (T("forget"), "m:st:forget")])
+    rows.append([(T("home"), "m:home")])
+    return T("ai_title") + "\n" + cmd_keys(), rows
 
 
 def scr_set(args):
@@ -2352,6 +2492,28 @@ def handle_menu(data, cb):
             else:
                 note = f"{c['name']}: {fmt_num(c['value'])}{c.get('unit', '')}"
         show("home", [], mid)
+    elif act == "ak":                                              # ➕ Add AI token: next message = the key
+        start_key_prompt(mid)
+    elif act == "ac":
+        with L:
+            state["awaiting_key"] = 0
+            ST.mark()
+        show("ai", [], mid)
+    elif act == "ap":                                              # provider chosen for a key we could not identify
+        if PENDING_KEY["key"] and time.time() - PENDING_KEY["ts"] < 600 and args:
+            key, PENDING_KEY["key"] = PENDING_KEY["key"], None
+            complete_key(args[0], key)
+        else:
+            note = T("key_expired")
+    elif act == "kd":
+        with L:
+            KEYS.data["keys"][:] = [k for k in KEYS.data["keys"] if k["id"] != (args[0] if args else "")]
+            KEYS.mark()
+        KEYS.save(force=True)
+        show("ai", [], mid)
+    elif act == "kt":
+        tg_send(test_all_keys())
+        show("ai", [], mid)
     elif act == "wd":
         with L:
             state["custom"][:] = [w for w in state["custom"] if w["id"] != (args[0] if args else "")]
@@ -2561,10 +2723,72 @@ def fast_command(text):
     return True
 
 
+def start_key_prompt(mid=None):
+    with L:
+        state["awaiting_key"] = time.time()
+        ST.mark()
+    rows = [[(T("cancel"), "m:ac")]]
+    if mid:
+        tg_edit(mid, T("key_prompt"), rows)
+    else:
+        tg_send_rows(T("key_prompt"), rows)
+
+
+def handle_key_message(text, msg_id=None):
+    """The user sent an API key (after the ➕ button, or on its own). Delete it, detect the service, test it."""
+    if msg_id:
+        try:
+            tg("deleteMessage", {"chat_id": TG_CHAT, "message_id": msg_id})
+        except requests.RequestException:
+            pass
+    parts = text.split()
+    first = PROVIDER_ALIASES.get(parts[0].lower(), parts[0].lower())
+    provider = model = base = None
+    if len(parts) >= 2 and first in PRESETS:
+        provider, key = first, parts[1]
+        model = parts[2] if len(parts) > 2 else None
+        base = parts[3] if len(parts) > 3 else None
+    else:
+        key = parts[0]
+    tg_typing()
+    if not provider:
+        provider = detect_provider(key)
+    if not provider:                                           # ask once, keep the key only in memory
+        PENDING_KEY.update(key=key, ts=time.time())
+        names = list(PRESETS)[:-1]
+        tg_send_rows(T("which_provider"), [[(n, f"m:ap:{n}") for n in names[i:i + 3]] for i in range(0, len(names), 3)])
+        return
+    complete_key(provider, key, model, base)
+
+
+def complete_key(provider, key, model=None, base=None):
+    try:
+        _, _, msg = setup_key(provider, key, model, base)
+    except ValueError as e:
+        msg = f"❌ {e}"
+    tg_send(msg)
+
+
+def test_all_keys():
+    lines = []
+    with L:
+        ks = list(KEYS.data["keys"])
+    for k in ks:
+        st, out = _test_key(k)
+        if st == 200:
+            mark_ok(k)
+            lines.append(f"✅ {k['id']} {k['provider']}/{k['model']}")
+        else:
+            mark_fail(k, st, out)
+            lines.append(f"❌ {k['id']} {k['provider']}: {st} {str(out)[:60]}")
+    KEYS.save(force=True)
+    return "\n".join(lines) or T("no_keys")
+
+
 HELP = """📱 /panel - control panel (devices, sensors, scenes, board, AI, settings)
 Quick: "turn on <device>" / "<device> خاموش" work without AI. Start a message with > to send it raw to serial.
 /devices /sensors /scenes /auto /board /graph temp 24 /log /history /export /lang fa|en
-/keys  /addkey provider KEY [model] [base_url]  /delkey ID  /mode agent|raw  /state  /status
+/keys  /addkey (then just send the key)  /delkey ID  /mode agent|raw  /state  /status
 /forget  /confirm on|off  /breaker reset  /keyboard off  /raw TEXT
 Providers: anthropic openai gemini groq openrouter deepseek mistral custom
 Anything else is understood by the AI agent (if a key works) or sent raw to the serial port.
@@ -2585,7 +2809,7 @@ def cmd_keys():
             else:
                 st = "✅ ready" + (f" (last ok {int(now - k['last_ok'])}s ago)" if k.get("last_ok") else "")
             lines.append(f"{k['id']} {k['provider']} {k['model']} {mask(k['key'])}  {st}")
-    return "\n".join(lines) or "No AI keys yet. Add one: /addkey groq YOUR_KEY"
+    return "\n".join(lines) or T("no_keys")
 
 
 def cmd_state():
@@ -2651,23 +2875,13 @@ def handle_command(text, msg):
             tg("deleteMessage", {"chat_id": TG_CHAT, "message_id": msg["message_id"]})
         except requests.RequestException:
             pass
-        if len(args) < 2:
-            return tg_send("Usage: /addkey provider KEY [model] [base_url]")
-        try:
-            k = add_key(args[0], args[1], args[2] if len(args) > 2 else None, args[3] if len(args) > 3 else None)
-        except ValueError as e:
-            return tg_send(f"❌ {e}")
-        try:
-            st, out = llm_call(k, "Reply with the single word OK.", [{"role": "user", "content": "ping"}])
-        except requests.RequestException as e:
-            st, out = 0, e.__class__.__name__
-        if st == 200:
-            mark_ok(k)
-            KEYS.save(force=True)
-            return tg_send(f"✅ Key {k['id']} ({k['provider']}/{k['model']}) works. Your message with the key was deleted.")
-        mark_fail(k, st, out)
-        KEYS.save(force=True)
-        return tg_send(f"⚠️ Key saved as {k['id']} but the test failed: {st} {out[:100]}\nCheck the model name: /addkey {args[0]} KEY MODEL")
+        if not args:
+            start_key_prompt()
+        else:
+            handle_key_message(" ".join(args))
+        return True
+    if cmd == "/cancel":
+        return tg_send(T("key_cancel"))
     if cmd == "/delkey" and args:
         with L:
             n0 = len(KEYS.data["keys"])
@@ -2707,6 +2921,20 @@ def handle_command(text, msg):
 def handle_text(text, msg):
     text = text.strip()
     if not text:
+        return
+    aw = state.get("awaiting_key", 0)
+    if aw:
+        with L:
+            state["awaiting_key"] = 0
+            ST.mark()
+        if time.time() - aw < 600 and not text.startswith("/"):
+            handle_key_message(text, msg.get("message_id"))
+            return
+        if text.lower().startswith("/cancel"):
+            tg_send(T("key_cancel"))
+            return
+    if looks_like_key(text):                       # a key sent on its own is never shown to the AI or stored in history
+        handle_key_message(text, msg.get("message_id"))
         return
     if text.startswith("/"):
         if handle_command(text, msg) is not None:
